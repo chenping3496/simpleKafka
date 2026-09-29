@@ -14,6 +14,7 @@ import java.util.Map;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
+import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.logging.Level;
@@ -226,14 +227,14 @@ public class Broker {
 
     // 如果当前broker是分区leader，则将消息追加到分区日志中
         long offset = p.append(message);
-    // 将消息复制到所有follower节点
-        replicateToFollowers(topic, p, message, offset);
+        // acks=all：等所有 follower 都 ack 才算成功，否则回失败状态
+        boolean allAcked = replicateToFollowers(topic, p, message, offset);
 
-        // 回响应：[1B][8B offset][1B status]
+        // 回响应：[1B][8B offset][1B status]  status=0 成功(所有副本已确认) / 1 失败
         ByteBuffer resp = ByteBuffer.allocate(10);
         resp.put(Protocol.PRODUCE_RESPONSE);
         resp.putLong(offset);
-        resp.put((byte)(offset > -1 ? 0 : 1));
+        resp.put((byte)(allAcked ? 0 : 1));
         resp.flip();
         clientChannel.write(resp);
     }
@@ -428,43 +429,72 @@ public class Broker {
 
     //================复制========================
     /**
-     * 将消息复制到主题的所有从节点（follower）上
-     * 该方法采用异步方式将消息发送到集群中的其他broker节点
+     * 将消息复制到主题的所有从节点（follower）上 —— acks=all 语义。
+     * <p>
+     * leader 本地 append 之后，必须等所有 follower 都回 REPLICATE_ACK 才算成功；
+     * 任一 follower 失败/超时 → 返回 false，produce 响应标记失败。
+     * 仍用线程池并行复制，但用 CountDownLatch 同步等待全部完成（带 5s 超时，
+     * 避免某个 follower 挂死把 producer 拖死）。
      *
      * @param topic 主题名称
      * @param partition 分区对象
      * @param message 要复制消息的字节数组
      * @param offset 消息的偏移量
+     * @return true=所有 follower 都 ack；false=至少一个 follower 失败/超时
      */
-    private void replicateToFollowers(String topic, Partition partition, byte[] message, long offset) {
-        // 遍历分区中的所有从节点ID
+    private boolean replicateToFollowers(String topic, Partition partition, byte[] message, long offset) {
+        // 统计需要等待的 follower 数（跳过自己和不在集群的）
+        int pending = 0;
         for (int followerId : partition.getFollowers()) {
-            // 如果是当前broker自身，则跳过复制
             if (followerId == brokerId) continue;
-            // 从集群元数据中获取从节点信息
+            if (clusterMetadata.get(followerId) == null) continue;
+            pending++;
+        }
+        if (pending == 0) {
+            return true;   // 没有需要复制的 follower，视为全部 ack
+        }
+
+        CountDownLatch latch = new CountDownLatch(pending);
+        AtomicBoolean allAcked = new AtomicBoolean(true);
+
+        for (int followerId : partition.getFollowers()) {
+            if (followerId == brokerId) continue;
             BrokerInfo follower = clusterMetadata.get(followerId);
-            // 如果从节点信息不存在，则跳过
             if (follower == null) continue;
 
-            // 使用线程池异步提交复制任务
-            executor.submit(() -> {   // 异步：submit后立刻返回
+            executor.submit(() -> {   // 并行复制，但主线程会 await 全部完成
                 try (SocketChannel ch = SocketChannel.open()) {
-                    // 建立与从节点的Socket连接
                     ch.connect(new InetSocketAddress(follower.getHost(), follower.getPort()));
-                    // 发送复制请求
                     ch.write(Protocol.encodeReplicateRequest(topic, partition.getId(), offset, message));
-                    // 读取从节点的响应
                     ByteBuffer resp = ByteBuffer.allocate(1);
                     ch.read(resp); resp.flip();
                     byte ack = resp.get();
-                    // 记录复制结果日志
-                    LOGGER.info("Replication to " + followerId + (ack == Protocol.REPLICATE_ACK ? " ok" : " failed"));
+                    if (ack == Protocol.REPLICATE_ACK) {
+                        LOGGER.info("Replication to " + followerId + " ok");
+                    } else {
+                        allAcked.set(false);
+                        LOGGER.warning("Replication to " + followerId + " nack=" + ack);
+                    }
                 } catch (IOException e) {
-                    // 记录复制失败日志
+                    allAcked.set(false);
                     LOGGER.log(Level.SEVERE, "Replication to " + followerId + " failed", e);
+                } finally {
+                    latch.countDown();
                 }
             });
         }
+
+        try {
+            // acks=all：等所有 follower ack；超时则视为有副本未确认
+            if (!latch.await(5, TimeUnit.SECONDS)) {
+                LOGGER.warning("Replication timed out (5s), not all followers acked");
+                return false;
+            }
+        } catch (InterruptedException e) {
+            Thread.currentThread().interrupt();
+            return false;
+        }
+        return allAcked.get();
     }
 
 /**
@@ -474,30 +504,45 @@ public class Broker {
  * @throws IOException 如果发生I/O错误
  */
     private void handleReplicateRequest(SocketChannel clientChannel, ByteBuffer buffer) throws IOException {
-    // 从缓冲区中读取主题名称（短字符串）
+        // 从缓冲区中读取主题名称（短字符串）
         String topic = readShortString(buffer);
-    // 从缓冲区中读取分区ID
+        // 从缓冲区中读取分区ID
         int partitionId = buffer.getInt();
-    // 从缓冲区中读取偏移量
-        long offset = buffer.getLong();
-    // 从缓冲区中读取消息长度
+        // 从缓冲区中读取偏移量（leader 指定的权威 offset）
+        long leaderOffset = buffer.getLong();
+        // 从缓冲区中读取消息长度
         int msgLen = buffer.getInt();
-    // 根据消息长度创建字节数组
+        // 根据消息长度创建字节数组
         byte[] message = new byte[msgLen];
-    // 从缓冲区中读取消息内容到字节数组
+        // 从缓冲区中读取消息内容到字节数组
         buffer.get(message);
 
-    // 查找指定主题和分区的Partition对象
+        // 查找指定主题和分区的Partition对象
         Partition p = findPartition(topic, partitionId);
-    // 如果找不到对应的分区，返回错误响应
+        // 如果找不到对应的分区，返回失败响应
         if (p == null) {
             ByteBuffer resp = ByteBuffer.allocate(1); resp.put((byte)0); resp.flip();
             clientChannel.write(resp); return;
         }
-        p.append(message);   // follower 也调 append，offset 由本地分配
+
+        // ★ 偏移量一致性：follower 必须用 leader 的 offset 写入，而非本地 nextOffset 重编号。
+        // 仅当 leaderOffset == 本地 nextOffset（follower 已追平、与 leader 同步）才写入；
+        // 否则说明 follower 失步（漏收前序消息，或重复收到已写过的 offset），
+        // 拒绝写入并回失败 ack —— 避免静默重编号导致 failover 后按 offset 取错消息。
+        // 真正的 Kafka 这时触发 follower 从 leader 按 nextOffset 重新拉取追平（HW/ISR）。
+        byte ack;
+        if (leaderOffset == p.getNextOffset().get()) {
+            long written = p.append(message);   // 内部用 nextOffset，与 leaderOffset 相等
+            ack = (written == leaderOffset) ? Protocol.REPLICATE_ACK : (byte)0;
+        } else {
+            LOGGER.warning("Follower out of sync: topic=" + topic + " partition=" + partitionId
+                    + " leaderOffset=" + leaderOffset + " localNextOffset=" + p.getNextOffset().get()
+                    + " — 拒绝复制，需从 leader 重新追平");
+            ack = 0;   // 失步，拒绝
+        }
 
         ByteBuffer resp = ByteBuffer.allocate(1);
-        resp.put(Protocol.REPLICATE_ACK);
+        resp.put(ack);
         resp.flip();
         clientChannel.write(resp);
     }
